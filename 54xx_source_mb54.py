@@ -29,10 +29,15 @@
         出力0=低い「ゴォー」(約170Hz帯), 出力1=中音(約450Hz帯), 出力2=「ザー」(約2.5kHz帯)
         例: 低音を強く、ザーを弱くしたい → --level0 15 --level2 6
 
-  --decay-div                      (1〜16, 初期値 2)
-        音量が1段階下がるまでの時間(256回ループ × この値)。大きいほどゆっくり消えます。
-        初期値 2 で、音量15→0 まで約1.6秒(旧MAMEの爆発音 1.7〜2.6秒に近づけるなら 3〜4)。
-        目安: 1 → 約0.8秒 / 2 → 約1.6秒 / 3 → 約2.4秒 / 4 → 約3.2秒
+  --decay-div0 / --decay-div1 / --decay-div2   (1〜16, 初期値 2)
+        各出力ごとの「減衰の遅さ」です。音量が1段階下がるまでの時間(256回ループ × この値)で、
+        大きいほどゆっくり消えます。出力ごとに独立して設定できます。
+        音量15→0 までの目安: 1 → 約0.8秒 / 2 → 約1.6秒 / 3 → 約2.4秒 / 4 → 約3.2秒
+        (旧MAMEの爆発音 1.7〜2.6秒に近づけるなら 3〜4)
+        例: 低音は長く、ザーは短く → --decay-div0 4 --decay-div1 3 --decay-div2 1
+
+  --decay-div                      (1〜16)
+        上の3つをまとめて同じ値にする近道です。個別指定(--decay-div0〜2)があれば、そちらが優先。
 
   --seed                           (16bit の16進数, 初期値 0xC3A5, 0 は不可)
         ノイズ(乱数)の初期値です。音の「ザラつき方」が少し変わるだけで、通常は変更不要です。
@@ -56,8 +61,18 @@
   --info                           作成後の特性(ループ速度、減衰時間)を表示
   --preview DIR                    FBNeo と同じフィルタを通した確認用 WAV を DIR に書き出す
 
+■ 何が独立で、何が共通か
+  [出力ごとに独立]  鳴り始めの音量(--level)・減衰の遅さ(--decay-div0/1/2)・発音の命令との対応(--trigger)
+                    → 3つの出力は、それぞれ別の音量カウンタと、別の減衰カウンタを持ちます。
+                      ある出力が鳴っている最中に別の出力を鳴らしても、互いに影響しません。
+  [3つで共通]       ノイズの元(16bit 乱数 1個。出力ごとに別のビット位置を使用)
+                    ノイズの更新速度(約4.7kHz。--pad-nops で全体が変わる)
+                    減衰の基準タイマー(256ループごと)
+  ※ MB8844 は CPU が1つなので、3つの出力は、1つのループの中で順番に更新しています(同時処理)。
+
 ■ MB8844 の RAM の使い方(上級者向け)
-   0: A の退避   4: Y の退避   5: 命令の上位4bit   2,3: 減衰タイマー(下位/上位)   6: 減衰の分周
+   0: A の退避   4: Y の退避   5: 命令の上位4bit   2,3: 減衰の基準タイマー(下位/上位)
+   6,7,1: 出力0,1,2 の減衰カウンタ
    8〜11: 16bit 乱数 N0〜N3(N3 が最上位)   12,13,14: 出力0,1,2 の音量   15: 読み飛ばす残りバイト数
 """
 import argparse, math, os, shutil, struct, sys, wave, zipfile, random
@@ -65,7 +80,7 @@ import argparse, math, os, shutil, struct, sys, wave, zipfile, random
 # ======================================================================== 初期設定
 DEFAULTS = dict(
     level=[15, 15, 15],            # 各出力の鳴り始めの音量 (0-15)
-    decay_div=2,                   # 減衰の間隔 (256ループ × この値)
+    decay_div=[2, 2, 2],           # 出力ごとの減衰の間隔 (256ループ × この値)
     seed=0xC3A5,                   # 乱数の初期値
     pad_nops=0,                    # ループに足す nop の数
     trigger={1: 0, 2: 1, 5: 2},    # 命令の上位4bit -> 鳴らす出力
@@ -287,8 +302,8 @@ def assemble(prog):
 def check_params(p):
     if len(p['level']) != 3 or any(not (0 <= v <= 15) for v in p['level']):
         raise ValueError('--level0/1/2 は 0〜15 で指定してください')
-    if not (1 <= p['decay_div'] <= 16):
-        raise ValueError('--decay-div は 1〜16 で指定してください')
+    if len(p['decay_div']) != 3 or any(not (1 <= v <= 16) for v in p['decay_div']):
+        raise ValueError('--decay-div(0/1/2) は 1〜16 で指定してください')
     if not (1 <= p['seed'] <= 0xFFFF):
         raise ValueError('--seed は 0x0001〜0xFFFF で指定してください(0 は不可)')
     if not (0 <= p['pad_nops'] <= 60):
@@ -315,7 +330,8 @@ def program(p):
     a('label', 'main')
     a('lxi', 0)                                             # X=0 固定(以後、番地は Y だけで指定)
     for y, v in ((8, nib[0]), (9, nib[1]), (10, nib[2]), (11, nib[3]),
-                 (12, 0), (13, 0), (14, 0), (15, 0), (2, 0), (3, 0), (6, 16 - p['decay_div'])):
+                 (12, 0), (13, 0), (14, 0), (15, 0), (2, 0), (3, 0),
+                 (6, 16 - p['decay_div'][0]), (7, 16 - p['decay_div'][1]), (1, 16 - p['decay_div'][2])):
         a('ldy', y); a('li', v); a('stm')
     a('en', 0x04)                                           # 外部割り込み許可
     a('label', 'loop')
@@ -337,15 +353,16 @@ def program(p):
         elif ch == 1: a('setc'); a('outO')
         else: a('ldy', 1); a('outR')
     for _ in range(p['pad_nops']): a('nop')
-    # ---- 256ループごとの減衰タイマー(さらに --decay-div で分周)
+    # ---- 減衰: 256ループごとの共通タイマーのあと、出力ごとに独立した分周カウンタで音量を1段階下げる
+    divcell = (6, 7, 1)
     a('ldy', 2); a('icm'); a('jpl', 'loop')
     a('ldy', 3); a('icm'); a('jpl', 'loop')
-    a('ldy', 6); a('icm'); a('jpl', 'loop')
-    a('li', 16 - p['decay_div']); a('ldy', 6); a('stm')
     for ch, env_y in enumerate((12, 13, 14)):
-        a('ldy', env_y); a('ldm'); a('ci', 0); a('jpl', 'd%ddec' % ch); a('jpl', 'd%ddone' % ch)
-        a('label', 'd%ddec' % ch); a('dcm')
-        a('label', 'd%ddone' % ch)
+        a('ldy', divcell[ch]); a('icm'); a('jpl', 'e%dskip' % ch)        # この出力の分周がまだなら次へ
+        a('li', 16 - p['decay_div'][ch]); a('ldy', divcell[ch]); a('stm')  # 分周カウンタを再設定
+        a('ldy', env_y); a('ldm'); a('ci', 0); a('jpl', 'd%ddec' % ch); a('jpl', 'e%dskip' % ch)
+        a('label', 'd%ddec' % ch); a('dcm')                                # 音量が0でなければ1段階下げる
+        a('label', 'e%dskip' % ch)
     a('li', 0); a('jpl', 'loop')
     # ---- 外部割り込み: 06XX から来る命令1バイトの処理
     a('label', 'irq')
@@ -357,12 +374,15 @@ def program(p):
     cmds = sorted([(hi, 'trig', ch) for hi, ch in p['trigger'].items()] +
                   [(hi, 'skip', n) for hi, n in p['skip'].items()])
     for i, (hi, kind, arg) in enumerate(cmds):
-        a('ci', hi); a('jpl', 'nx%d' % i)
-        if kind == 'trig': a('li', p['level'][arg]); a('ldy', 12 + arg); a('stm')
+        last = (i == len(cmds) - 1)
+        a('ci', hi); a('jpl', 'done' if last else 'nx%d' % i)     # 一致しなければ次の判定へ(最後は終了へ)
+        if kind == 'trig':
+            a('li', p['level'][arg]); a('ldy', 12 + arg); a('stm')                       # 音量を設定
+            a('li', 16 - p['decay_div'][arg]); a('ldy', divcell[arg]); a('stm')          # この出力の減衰カウンタを再設定
         else: a('li', arg); a('ldy', 15); a('stm')
         a('jpl', 'done')
-        a('label', 'nx%d' % i)
-    a('jpl', 'done')
+        if not last: a('label', 'nx%d' % i)
+    if not cmds: a('jpl', 'done')
     a('label', 'fetching'); a('ldy', 15); a('dcm')
     a('label', 'done')
     a('xyd', 0); a('xd', 0); a('rti')
@@ -498,6 +518,13 @@ def selftest(rom, labels, p):
         h = Harness(rom); h.boot(); h.send(hi << 4)
         for i in range(n): h.send((list(p['trigger'])[0] << 4) | 1)
         report('命令 0x%Xn のあとの %d バイトを読み飛ばす' % (hi, n), [h.cpu.ram[12], h.cpu.ram[13], h.cpu.ram[14]] == [0, 0, 0] and h.cpu.ram[15] == 0)
+    # 出力ごとに減衰時間が独立して設定できる(出力0=1, 出力1=2, 出力2=4 → 約 0.8 : 1.6 : 3.2 秒)
+    p2 = dict(p, level=[15, 15, 15], decay_div=[1, 2, 4], trigger={1: 0, 2: 1, 5: 2})
+    rom2, lab2 = build(p2)
+    _, _, dec2 = measure(rom2, lab2, p2)
+    t = [dec2[1][1], dec2[2][1], dec2[5][1]]
+    report('出力ごとの減衰時間が独立している', abs(t[0] / 0.8 - 1) < 0.25 and abs(t[1] / 1.6 - 1) < 0.25 and abs(t[2] / 3.2 - 1) < 0.25,
+           '出力0/1/2 = %.2f / %.2f / %.2f 秒' % tuple(t))
     # 割り込み連打でも乱数列が壊れない
     def ref(st):
         lsb = st & 1; st >>= 1
@@ -539,7 +566,9 @@ def main():
     ap.add_argument('--level0', type=int, default=D['level'][0], help='出力0(低い「ゴォー」)の鳴り始めの音量 0-15 (既定 15)')
     ap.add_argument('--level1', type=int, default=D['level'][1], help='出力1(中音)の鳴り始めの音量 0-15 (既定 15)')
     ap.add_argument('--level2', type=int, default=D['level'][2], help='出力2(「ザー」)の鳴り始めの音量 0-15 (既定 15)')
-    ap.add_argument('--decay-div', type=int, default=D['decay_div'], help='減衰の遅さ 1-16。大きいほどゆっくり消える (既定 2 = 約1.6秒)')
+    ap.add_argument('--decay-div', type=int, default=None, help='3つの出力の減衰の遅さをまとめて指定 1-16 (個別指定が優先)')
+    for i in range(3):
+        ap.add_argument('--decay-div%d' % i, type=int, default=None, help='出力%dの減衰の遅さ 1-16。大きいほどゆっくり消える (既定 2 = 約1.6秒)' % i)
     ap.add_argument('--seed', type=lambda s: int(s, 0), default=D['seed'], help='乱数の初期値(16bit, 0以外) (既定 0xC3A5)')
     ap.add_argument('--pad-nops', type=int, default=D['pad_nops'], help='ループに足す nop の数 0-60。増やすとこもった音になる (既定 0)')
     ap.add_argument('--trigger', default=','.join('%d:%d' % kv for kv in D['trigger'].items()),
@@ -553,7 +582,9 @@ def main():
     ap.add_argument('--preview', metavar='DIR', help='確認用の WAV を DIR に書き出す(FBNeo と同じフィルタを通した音)')
     args = ap.parse_args()
     try:
-        p = dict(level=[args.level0, args.level1, args.level2], decay_div=args.decay_div, seed=args.seed,
+        base = args.decay_div if args.decay_div is not None else D['decay_div'][0]
+        dd = [getattr(args, 'decay_div%d' % i) if getattr(args, 'decay_div%d' % i) is not None else base for i in range(3)]
+        p = dict(level=[args.level0, args.level1, args.level2], decay_div=dd, seed=args.seed,
                  pad_nops=args.pad_nops, trigger=parse_map(args.trigger, '--trigger'), skip=parse_map(args.skip, '--skip'))
         rom, labels = build(p)
     except ValueError as e:
